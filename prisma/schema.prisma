@@ -1,0 +1,1402 @@
+// StudyQuest — data model
+//
+// Design notes:
+//  * Every coin movement is a row in CoinLedgerEntry with a unique idempotency
+//    key. Nothing in the codebase increments a balance directly.
+//  * Day boundaries are stored as "YYYY-MM-DD" strings computed in the user's
+//    own timezone, so streaks and daily limits behave correctly worldwide.
+//  * Fields marked RESERVED exist so the future game systems (XP, ranks,
+//    characters, shop) can be added without a migration-heavy rewrite. Nothing
+//    in this version reads or writes them.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Plan {
+  FREE
+  PREMIUM
+}
+
+enum CoinSource {
+  APP_TIME
+  /// Bonus for time spent actually studying, as opposed to merely being present.
+  STUDY_BONUS
+  DAILY_QUIZ
+  DAILY_QUIZ_BONUS
+  FLASHCARD_SET
+  QUIZ_ATTEMPT
+  ADJUSTMENT
+  SPEND
+}
+
+enum CardRating {
+  KNOW
+  PARTIAL
+  DONT_KNOW
+}
+
+enum StudyMode {
+  SMART
+  CRAM
+}
+
+enum QuestionType {
+  MCQ_SINGLE
+  MCQ_MULTI
+  WRITTEN
+}
+
+enum QuizOrigin {
+  MANUAL
+  PDF_IMPORT
+  AI_IMPROVEMENT
+  TEST_FEEDBACK
+}
+
+enum AttemptStatus {
+  IN_PROGRESS
+  SUBMITTED
+  MARKED
+}
+
+enum MarkingStatus {
+  NOT_REQUIRED
+  PENDING
+  COMPLETE
+  FAILED
+}
+
+enum UploadKind {
+  QUIZ_SOURCE
+  TEST_PAPER
+  CARD_IMAGE
+  QUESTION_IMAGE
+  AVATAR
+}
+
+enum UploadStatus {
+  PENDING
+  PROCESSING
+  READY
+  FAILED
+}
+
+enum AiJobType {
+  PDF_TO_QUIZ
+  MARK_ATTEMPT
+  TEST_FEEDBACK
+  IMPROVEMENT_QUIZ
+}
+
+enum AiJobStatus {
+  QUEUED
+  RUNNING
+  COMPLETE
+  FAILED
+}
+
+enum UsageFeature {
+  PDF_TO_QUIZ
+  TEST_FEEDBACK
+}
+
+enum CommunityAccess {
+  PUBLIC
+  PRIVATE
+  REQUEST
+}
+
+enum CommunityRole {
+  LEADER
+  MODERATOR
+  MEMBER
+}
+
+enum JoinRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum ResourceType {
+  FLASHCARD_SET
+  QUIZ
+}
+
+enum DailyQuizStatus {
+  PENDING
+  COMPLETED
+}
+
+// ---------------------------------------------------------------------------
+// Identity & billing
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  username      String?   @unique
+  email         String?   @unique
+  emailVerified DateTime?
+  /// Avatar URL from an OAuth provider. Uploaded avatars use `imageKey`.
+  image         String?
+  /// Storage key for an uploaded avatar. Takes precedence over `image`.
+  imageKey      String?
+  passwordHash  String?
+
+  plan          Plan      @default(FREE)
+  planExpiresAt DateTime?
+
+  /// Cached SUM(CoinLedgerEntry.amount). Written only inside the same
+  /// transaction as the ledger row it reflects. Verify with scripts/reconcile.
+  coinBalance   Int       @default(0)
+
+  timezone      String    @default("Europe/London")
+  /// When the timezone was last changed. Daily caps are keyed on local dates,
+  /// so unrestricted timezone changes would be a way to reset them — changes
+  /// are rate-limited and carry the day's counters with them.
+  timezoneChangedAt DateTime?
+
+  /// RESERVED for the future game systems. Never read or written in this version.
+  xp            Int       @default(0)
+  /// Denormalised copy of ArenaProfile.rankKey.
+  ///
+  /// No longer reserved: `getRankMultiplier` reads it on every coin award, and
+  /// the Arena keeps it in step with the profile inside the same transaction
+  /// that moves Elo. The authority is ArenaProfile; this column exists so the
+  /// coin path never has to join to it.
+  rankTier      String?
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  accounts           Account[]
+  sessions           Session[]
+  subscription       Subscription?
+  ledgerEntries      CoinLedgerEntry[]
+  dailyCounters      CoinDailyCounter[]
+  studyTimeDays      StudyTimeDay[]
+  usageCounters      UsageCounter[]
+  flashcardSets      FlashcardSet[]
+  cardReviewStates   CardReviewState[]
+  cardReviews        CardReview[]
+  cramSessions       CramSession[]
+  setCompletions     SetCompletion[]
+  quizzes            Quiz[]
+  quizAttempts       QuizAttempt[]
+  uploads            Upload[]
+  aiJobs             AiJob[]
+  testSubmissions    TestSubmission[]
+  generatedPractice  GeneratedPractice[]
+  libraryItems       LibraryItem[]
+  communities        Community[]           @relation("CommunityOwner")
+  memberships        CommunityMember[]
+  joinRequests       CommunityJoinRequest[] @relation("JoinRequestUser")
+  decidedRequests    CommunityJoinRequest[] @relation("JoinRequestDecider")
+  invitesCreated     CommunityInvite[]     @relation("InviteCreator")
+  invitesReceived    CommunityInvite[]     @relation("InviteTarget")
+  posts              CommunityPost[]
+  comments           CommunityComment[]
+  sharedResources    CommunityResource[]
+  dailyAssignments   DailyQuizAssignment[]
+  streak             StreakState?
+  resetTokens        PasswordResetToken[]
+
+  // Arena
+  arenaProfile       ArenaProfile?
+  bankServes         BankServe[]
+  queueEntry         MatchQueueEntry?
+  matchPlayers       MatchPlayer[]
+  eloEvents          EloEvent[]
+  cosmeticsOwned     CosmeticOwnership[]
+  cosmeticsEquipped  EquippedCosmetic[]
+
+  @@index([plan])
+}
+
+model Account {
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  sessionToken String   @id
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String
+  expires    DateTime
+
+  @@id([identifier, token])
+}
+
+/// Billing seam. This version sets `plan` directly; Stripe (or another
+/// provider) fills these columns later without touching limit enforcement.
+model Subscription {
+  id                     String    @id @default(cuid())
+  userId                 String    @unique
+  provider               String    @default("manual")
+  providerCustomerId     String?
+  providerSubscriptionId String?
+  status                 String    @default("active")
+  currentPeriodEnd       DateTime?
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ---------------------------------------------------------------------------
+// Study Coins
+// ---------------------------------------------------------------------------
+
+/// Append-only. Never updated, never deleted.
+model CoinLedgerEntry {
+  id             String     @id @default(cuid())
+  userId         String
+  amount         Int
+  baseAmount     Int
+  multiplier     Decimal    @default(1.0) @db.Decimal(5, 2)
+  source         CoinSource
+  /// Unique per award. Replaying a request hits this constraint and awards nothing.
+  idempotencyKey String     @unique
+  refType        String?
+  refId          String?
+  metadata       Json?
+  createdAt      DateTime   @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([userId, source, createdAt])
+}
+
+/// Per-day, per-source counters backing the free/premium daily limits.
+model CoinDailyCounter {
+  id     String     @id @default(cuid())
+  userId String
+  day    String     @db.VarChar(10)
+  source CoinSource
+  count  Int        @default(0)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, day, source])
+}
+
+/// Active-time accrual. `activeSeconds` only ever grows by clamped, real
+/// elapsed server time, which is what makes the timer unfarmable.
+model StudyTimeDay {
+  id              String   @id @default(cuid())
+  userId          String
+  day             String   @db.VarChar(10)
+  /// Active time anywhere in the app. Drives the per-interval coin.
+  activeSeconds   Int      @default(0)
+  coinsAwarded    Int      @default(0)
+
+  /// Active time spent on a study page, verified against real study activity
+  /// rather than taken from the client's word. Drives the study bonus.
+  studySeconds        Int  @default(0)
+  studyBonusesAwarded Int  @default(0)
+
+  lastHeartbeatAt DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, day])
+}
+
+/// Daily quotas for AI-backed uploads (separate allowance per feature).
+model UsageCounter {
+  id      String       @id @default(cuid())
+  userId  String
+  day     String       @db.VarChar(10)
+  feature UsageFeature
+  count   Int          @default(0)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, day, feature])
+}
+
+// ---------------------------------------------------------------------------
+// Flashcards
+// ---------------------------------------------------------------------------
+
+model FlashcardSet {
+  id          String    @id @default(cuid())
+  ownerId     String
+  title       String
+  description String?
+  subject     String?
+  isPublic    Boolean   @default(false)
+  publishedAt DateTime?
+  /// Set this was copied from, when downloaded out of the public library.
+  sourceSetId String?
+  cardCount   Int       @default(0)
+  downloads   Int       @default(0)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  owner       User               @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  source      FlashcardSet?      @relation("SetCopies", fields: [sourceSetId], references: [id], onDelete: SetNull)
+  copies      FlashcardSet[]     @relation("SetCopies")
+  cards       Flashcard[]
+  reviewState CardReviewState[]
+  cramSessions CramSession[]
+  completions SetCompletion[]
+  libraryItems LibraryItem[]
+  shares      CommunityResource[]
+
+  @@index([ownerId])
+  @@index([isPublic, publishedAt])
+  @@index([subject])
+}
+
+model Flashcard {
+  id       String @id @default(cuid())
+  setId    String
+  front    String @db.Text
+  back     String @db.Text
+  hint     String?
+  position Int    @default(0)
+
+  /// Storage keys for optional images. Served through an authorised route,
+  /// never from a public path.
+  frontImageKey String?
+  backImageKey  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  set          FlashcardSet      @relation(fields: [setId], references: [id], onDelete: Cascade)
+  reviewStates CardReviewState[]
+  reviews      CardReview[]
+
+  @@index([setId, position])
+}
+
+/// One row per (user, card): the adaptive spaced-repetition state.
+model CardReviewState {
+  id            String     @id @default(cuid())
+  userId        String
+  cardId        String
+  setId         String
+  intervalHours Float      @default(24)
+  ease          Float      @default(1.0)
+  knowStreak    Int        @default(0)
+  lapses        Int        @default(0)
+  reviewCount   Int        @default(0)
+  lastRating    CardRating?
+  lastReviewAt  DateTime?
+  dueAt         DateTime   @default(now())
+
+  user User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  card Flashcard    @relation(fields: [cardId], references: [id], onDelete: Cascade)
+  set  FlashcardSet @relation(fields: [setId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, cardId])
+  @@index([userId, setId, dueAt])
+}
+
+/// Audit trail of every review — makes scheduling behaviour explainable and tunable.
+model CardReview {
+  id                  String     @id @default(cuid())
+  userId              String
+  cardId              String
+  setId               String
+  rating              CardRating
+  mode                StudyMode
+  intervalBeforeHours Float?
+  intervalAfterHours  Float?
+  reviewedAt          DateTime   @default(now())
+
+  user User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  card Flashcard @relation(fields: [cardId], references: [id], onDelete: Cascade)
+
+  @@index([userId, cardId, reviewedAt])
+  @@index([userId, setId, reviewedAt])
+}
+
+/// Cram Mode: loops the unknown pile until it is empty.
+model CramSession {
+  id            String    @id @default(cuid())
+  userId        String
+  setId         String
+  round         Int       @default(1)
+  /// Cards still to be seen in the current pass. Hitting 0 starts a new round.
+  roundRemaining Int      @default(0)
+  knownCardIds  String[]  @default([])
+  unknownCardIds String[] @default([])
+  startedAt     DateTime  @default(now())
+  completedAt   DateTime?
+
+  user User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  set  FlashcardSet @relation(fields: [setId], references: [id], onDelete: Cascade)
+
+  @@index([userId, setId, startedAt])
+}
+
+/// Recorded when a user gets every card in a set into the Known pile.
+/// Drives the 3-day per-set reward cooldown.
+model SetCompletion {
+  id           String    @id @default(cuid())
+  userId       String
+  setId        String
+  mode         StudyMode
+  cardCount    Int
+  coinsAwarded Int       @default(0)
+  rewarded     Boolean   @default(false)
+  /// Why no coins, when coinsAwarded is 0 (cooldown / too new / daily limit).
+  skipReason   String?
+  completedAt  DateTime  @default(now())
+
+  user User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  set  FlashcardSet @relation(fields: [setId], references: [id], onDelete: Cascade)
+
+  @@index([userId, setId, completedAt])
+}
+
+// ---------------------------------------------------------------------------
+// Quizzes
+// ---------------------------------------------------------------------------
+
+model Quiz {
+  id           String     @id @default(cuid())
+  ownerId      String
+  title        String
+  description  String?
+  subject      String?
+  isPublic     Boolean    @default(false)
+  publishedAt  DateTime?
+  sourceQuizId String?
+  origin       QuizOrigin @default(MANUAL)
+  /// Denormalised SUM(question.marks); recomputed whenever questions change.
+  totalMarks   Int        @default(0)
+  questionCount Int       @default(0)
+  downloads    Int        @default(0)
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  owner        User               @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  source       Quiz?              @relation("QuizCopies", fields: [sourceQuizId], references: [id], onDelete: SetNull)
+  copies       Quiz[]             @relation("QuizCopies")
+  questions    Question[]
+  attempts     QuizAttempt[]
+  libraryItems LibraryItem[]
+  shares       CommunityResource[]
+  practice     GeneratedPractice[]
+
+  @@index([ownerId])
+  @@index([isPublic, publishedAt])
+  @@index([subject])
+}
+
+model Question {
+  id          String       @id @default(cuid())
+  quizId      String
+  type        QuestionType
+  prompt      String       @db.Text
+  /// Marks this question is worth. Drives the 1.5 min/mark timer.
+  marks       Int          @default(1)
+  position    Int          @default(0)
+  /// Storage key for an optional image shown with the question.
+  imageKey    String?
+  /// Model answer / marking guidance. NEVER sent to the client mid-attempt.
+  markScheme  String?      @db.Text
+  explanation String?      @db.Text
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  quiz    Quiz             @relation(fields: [quizId], references: [id], onDelete: Cascade)
+  options QuestionOption[]
+  answers AttemptAnswer[]
+
+  @@index([quizId, position])
+}
+
+model QuestionOption {
+  id         String  @id @default(cuid())
+  questionId String
+  text       String  @db.Text
+  /// NEVER sent to the client before submission.
+  isCorrect  Boolean @default(false)
+  position   Int     @default(0)
+
+  question Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  @@index([questionId, position])
+}
+
+model QuizAttempt {
+  id       String        @id @default(cuid())
+  userId   String
+  quizId   String
+  status   AttemptStatus @default(IN_PROGRESS)
+
+  startedAt        DateTime @default(now())
+  /// Authoritative deadline written server-side at creation. The client timer
+  /// is cosmetic; expiry is judged against this.
+  serverDeadlineAt DateTime
+  submittedAt      DateTime?
+  timeExpired      Boolean  @default(false)
+
+  totalMarks   Int           @default(0)
+  awardedMarks Int           @default(0)
+  percentage   Int           @default(0)
+  markingStatus MarkingStatus @default(NOT_REQUIRED)
+
+  /// The percentage AS MARKED BY THE SERVER, frozen when marking completed.
+  /// Coins are decided from this and never from `percentage`, which moves when
+  /// the user overrides the AI. Otherwise "I disagree with the AI" would be a
+  /// button that prints Study Coins.
+  markedPercentage Int        @default(0)
+  overrideCount    Int        @default(0)
+
+  coinsAwarded Int     @default(0)
+  /// Why no coins were awarded, when applicable.
+  coinSkipReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user    User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  quiz    Quiz            @relation(fields: [quizId], references: [id], onDelete: Cascade)
+  answers AttemptAnswer[]
+
+  @@index([userId, quizId, submittedAt])
+  @@index([userId, status])
+}
+
+model AttemptAnswer {
+  id         String @id @default(cuid())
+  attemptId  String
+  questionId String
+
+  selectedOptionIds String[] @default([])
+  writtenAnswer     String?  @db.Text
+
+  /// Final marks used for scoring — either the server/AI mark or the user override.
+  awardedMarks Int @default(0)
+
+  aiMarks      Int?
+  aiFeedback   String? @db.Text
+  aiConfidence Float?
+
+  overridden       Boolean @default(false)
+  overrideMarks    Int?
+  overrideReason   String? @db.Text
+
+  markedAt  DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  attempt  QuizAttempt @relation(fields: [attemptId], references: [id], onDelete: Cascade)
+  question Question    @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  @@unique([attemptId, questionId])
+}
+
+// ---------------------------------------------------------------------------
+// Uploads, AI jobs, test feedback
+// ---------------------------------------------------------------------------
+
+model Upload {
+  id          String       @id @default(cuid())
+  userId      String
+  kind        UploadKind
+  storageKey  String
+  filename    String
+  mimeType    String
+  sizeBytes   Int
+  checksum    String
+  pageCount   Int?
+  extractedText String?    @db.Text
+  status      UploadStatus @default(PENDING)
+  error       String?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  testSubmissions TestSubmission[]
+
+  @@index([userId, kind, createdAt])
+}
+
+/// Durable queue. The worker (or a cron hit) picks these up, so nothing
+/// depends on the user keeping a tab open.
+model AiJob {
+  id             String      @id @default(cuid())
+  userId         String
+  type           AiJobType
+  status         AiJobStatus @default(QUEUED)
+  input          Json
+  output         Json?
+  error          String?     @db.Text
+  attempts       Int         @default(0)
+  maxAttempts    Int         @default(3)
+  runAfter       DateTime    @default(now())
+  startedAt      DateTime?
+  finishedAt     DateTime?
+  idempotencyKey String?     @unique
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([status, runAfter])
+  @@index([userId, type, createdAt])
+}
+
+model TestSubmission {
+  id        String       @id @default(cuid())
+  userId    String
+  uploadId  String
+  title     String
+  subject   String?
+  status    UploadStatus @default(PENDING)
+  error     String?
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  user   User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  upload Upload              @relation(fields: [uploadId], references: [id], onDelete: Cascade)
+  report TestFeedbackReport?
+
+  @@index([userId, createdAt])
+}
+
+model TestFeedbackReport {
+  id           String   @id @default(cuid())
+  submissionId String   @unique
+  summary      String   @db.Text
+  /// [{ topic, evidence }]
+  strengths    Json
+  /// [{ topic, evidence, suggestion }]
+  weaknesses   Json
+  /// [{ topic, correct, total }]
+  topicBreakdown Json
+  estimatedScore Int?
+  createdAt    DateTime @default(now())
+
+  submission TestSubmission      @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  practice   GeneratedPractice[]
+}
+
+/// Premium: AI-built practice targeting the weaknesses found in a test.
+/// Saving it into the quiz library is the user's choice, never automatic.
+model GeneratedPractice {
+  id        String   @id @default(cuid())
+  userId    String
+  reportId  String?
+  /// Set when (and only when) the user chooses to save it as a quiz.
+  quizId    String?
+  title     String
+  /// Full generated quiz payload, held until the user decides.
+  payload   Json
+  saved     Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  user   User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  report TestFeedbackReport? @relation(fields: [reportId], references: [id], onDelete: SetNull)
+  quiz   Quiz?               @relation(fields: [quizId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Communities
+// ---------------------------------------------------------------------------
+
+model Community {
+  id          String          @id @default(cuid())
+  slug        String          @unique
+  name        String
+  description String?
+  subject     String?
+  accent      String          @default("violet")
+  access      CommunityAccess @default(PUBLIC)
+  ownerId     String
+  memberCount Int             @default(1)
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  owner        User                   @relation("CommunityOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  members      CommunityMember[]
+  joinRequests CommunityJoinRequest[]
+  invites      CommunityInvite[]
+  posts        CommunityPost[]
+  resources    CommunityResource[]
+
+  @@index([access, memberCount])
+  @@index([subject])
+}
+
+model CommunityMember {
+  id          String        @id @default(cuid())
+  communityId String
+  userId      String
+  role        CommunityRole @default(MEMBER)
+  joinedAt    DateTime      @default(now())
+
+  community Community @relation(fields: [communityId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([communityId, userId])
+  @@index([userId])
+}
+
+model CommunityJoinRequest {
+  id          String            @id @default(cuid())
+  communityId String
+  userId      String
+  message     String?
+  status      JoinRequestStatus @default(PENDING)
+  decidedById String?
+  decidedAt   DateTime?
+  createdAt   DateTime          @default(now())
+
+  community Community @relation(fields: [communityId], references: [id], onDelete: Cascade)
+  user      User      @relation("JoinRequestUser", fields: [userId], references: [id], onDelete: Cascade)
+  decidedBy User?     @relation("JoinRequestDecider", fields: [decidedById], references: [id], onDelete: SetNull)
+
+  @@unique([communityId, userId])
+  @@index([communityId, status])
+}
+
+model CommunityInvite {
+  id            String    @id @default(cuid())
+  communityId   String
+  code          String    @unique
+  createdById   String
+  invitedUserId String?
+  maxUses       Int       @default(1)
+  useCount      Int       @default(0)
+  expiresAt     DateTime?
+  createdAt     DateTime  @default(now())
+
+  community   Community @relation(fields: [communityId], references: [id], onDelete: Cascade)
+  createdBy   User      @relation("InviteCreator", fields: [createdById], references: [id], onDelete: Cascade)
+  invitedUser User?     @relation("InviteTarget", fields: [invitedUserId], references: [id], onDelete: SetNull)
+
+  @@index([communityId, createdAt])
+}
+
+model CommunityPost {
+  id          String   @id @default(cuid())
+  communityId String
+  authorId    String
+  body        String   @db.Text
+  pinned      Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  community Community          @relation(fields: [communityId], references: [id], onDelete: Cascade)
+  author    User               @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  comments  CommunityComment[]
+
+  @@index([communityId, pinned, createdAt])
+}
+
+model CommunityComment {
+  id        String   @id @default(cuid())
+  postId    String
+  authorId  String
+  body      String   @db.Text
+  createdAt DateTime @default(now())
+
+  post   CommunityPost @relation(fields: [postId], references: [id], onDelete: Cascade)
+  author User          @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  @@index([postId, createdAt])
+}
+
+model CommunityResource {
+  id             String       @id @default(cuid())
+  communityId    String
+  sharedById     String
+  type           ResourceType
+  flashcardSetId String?
+  quizId         String?
+  note           String?
+  createdAt      DateTime     @default(now())
+
+  community    Community     @relation(fields: [communityId], references: [id], onDelete: Cascade)
+  sharedBy     User          @relation(fields: [sharedById], references: [id], onDelete: Cascade)
+  flashcardSet FlashcardSet? @relation(fields: [flashcardSetId], references: [id], onDelete: Cascade)
+  quiz         Quiz?         @relation(fields: [quizId], references: [id], onDelete: Cascade)
+
+  /// Sharing the same set or quiz again updates the existing row rather than
+  /// adding a second one — these constraints are what make that possible.
+  @@unique([communityId, flashcardSetId])
+  @@unique([communityId, quizId])
+  @@index([communityId, createdAt])
+}
+
+/// Single-use, expiring password reset tokens.
+/// Only the SHA-256 hash is stored — a leaked database row cannot be used to
+/// reset anybody's password.
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Daily quiz & streaks
+// ---------------------------------------------------------------------------
+
+/// Questions are snapshotted at generation time, so editing or deleting the
+/// source quiz mid-day cannot break today's daily quiz.
+model DailyQuizAssignment {
+  id        String          @id @default(cuid())
+  userId    String
+  day       String          @db.VarChar(10)
+  /// [{ questionId, quizId, type, prompt, marks, subject, options:[{id,text}] }]
+  questions Json
+  status    DailyQuizStatus @default(PENDING)
+  createdAt DateTime        @default(now())
+
+  user    User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  attempt DailyQuizAttempt?
+
+  @@unique([userId, day])
+}
+
+model DailyQuizAttempt {
+  id           String   @id @default(cuid())
+  assignmentId String   @unique
+  /// [{ questionId, selectedOptionIds, writtenAnswer, correct, marks }]
+  answers      Json
+  correctCount Int      @default(0)
+  totalCount   Int      @default(0)
+  allCorrect   Boolean  @default(false)
+  streakAtAttempt Int   @default(1)
+  multiplier   Decimal  @default(1.0) @db.Decimal(5, 2)
+  coinsAwarded Int      @default(0)
+  submittedAt  DateTime @default(now())
+
+  assignment DailyQuizAssignment @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+}
+
+model StreakState {
+  id            String   @id @default(cuid())
+  userId        String   @unique
+  currentStreak Int      @default(0)
+  longestStreak Int      @default(0)
+  /// "YYYY-MM-DD" in the user's timezone.
+  lastAttemptDay String? @db.VarChar(10)
+  updatedAt     DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ---------------------------------------------------------------------------
+// Library
+// ---------------------------------------------------------------------------
+
+/// What the user has downloaded from the public libraries. The daily quiz
+/// draws only from these plus the user's own content.
+model LibraryItem {
+  id             String       @id @default(cuid())
+  userId         String
+  type           ResourceType
+  flashcardSetId String?
+  quizId         String?
+  addedAt        DateTime     @default(now())
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  flashcardSet FlashcardSet? @relation(fields: [flashcardSetId], references: [id], onDelete: Cascade)
+  quiz         Quiz?         @relation(fields: [quizId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, flashcardSetId])
+  @@unique([userId, quizId])
+  @@index([userId, type])
+}
+
+// ---------------------------------------------------------------------------
+// Arena
+//
+// The competitive layer. Three rules shape every model below.
+//
+//  * The server is the only authority. A client reports what it clicked and
+//    how long it took; it never reports whether it was right, what it scored,
+//    or what Elo it should receive. `MatchAnswer.correct` and every figure on
+//    `MatchPlayer` are computed on the server from the stored question, the
+//    same way coins already work.
+//  * A match is a dealt hand. `Match.questionIds` fixes the order at creation,
+//    so both players meet the same questions in the same sequence and neither
+//    client decides what comes next.
+//  * Cosmetics are bought with Study Coins, so every purchase is a negative
+//    CoinLedgerEntry inside the same transaction that records ownership. There
+//    is no second balance and no way to own an item without having paid.
+// ---------------------------------------------------------------------------
+
+enum ArenaMatchStatus {
+  /// Both players accepted; the countdown is running.
+  STARTING
+  LIVE
+  /// Time expired or both players finished; results computed.
+  COMPLETE
+  /// Nobody joined, or it was abandoned before any answer landed.
+  ABANDONED
+}
+
+enum QueueStatus {
+  SEARCHING
+  MATCHED
+  CANCELLED
+  /// Gave up without finding anyone compatible.
+  EXPIRED
+}
+
+enum MatchOutcome {
+  WIN
+  LOSS
+  DRAW
+}
+
+enum CosmeticCategory {
+  HAT
+  CHESTPIECE
+  LEGGINGS
+  SHOES
+  GLOVES
+  WEAPON
+  PET
+  ACCESSORY
+}
+
+/// One row per user: everything the competitive layer needs about them.
+///
+/// Separate from User rather than more columns on it, because these are read
+/// together on every Arena screen and almost never on any other.
+model ArenaProfile {
+  id     String @id @default(cuid())
+  userId String @unique
+
+  /// Current rating. The starting value is the floor of the first rank.
+  elo     Int @default(1000)
+  peakElo Int @default(1000)
+  /// Denormalised from `elo` via the rank table, so the leaderboard can sort
+  /// and filter on it without recomputing per row.
+  rankKey String @default("student")
+  /// Highest rank ever held, which a demotion must not erase.
+  peakRankKey String @default("student")
+
+  matchesPlayed Int @default(0)
+  wins          Int @default(0)
+  losses        Int @default(0)
+  draws         Int @default(0)
+
+  currentWinStreak Int @default(0)
+  bestWinStreak    Int @default(0)
+
+  /// Lifetime totals, so averages never need a scan over every answer.
+  totalAnswered     Int @default(0)
+  totalCorrect      Int @default(0)
+  totalResponseMs   Int @default(0)
+
+  /// Region for the local leaderboard. Derived from the user's IANA timezone
+  /// on first write and overridable in settings; never inferred from an IP.
+  regionCode String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([rankKey, elo])
+  @@index([elo])
+  @@index([regionCode, elo])
+}
+
+/// A player waiting for an opponent.
+///
+/// One open row per user, enforced by a partial-free unique on `userId` plus a
+/// status check in the service. `subjects` is denormalised at enqueue time so
+/// candidate scanning never has to join through every set and quiz.
+model MatchQueueEntry {
+  id     String @id @default(cuid())
+  userId String @unique
+
+  status  QueueStatus @default(SEARCHING)
+  elo     Int
+  rankKey String
+  /// Normalised subject names the player has studied.
+  subjects String[]
+  /// Ids of quizzes the player has actually attempted, for knowledge overlap.
+  studiedQuizIds String[]
+
+  enqueuedAt DateTime  @default(now())
+  /// Touched on every poll. A searcher who stopped polling (closed the tab) goes
+  /// stale within seconds and is skipped by matchmaking, so no live player is
+  /// ever paired with a ghost.
+  lastPolledAt DateTime @default(now())
+  matchedAt  DateTime?
+  matchId    String?
+
+  user  User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  match Match? @relation(fields: [matchId], references: [id], onDelete: SetNull)
+
+  @@index([status, rankKey, elo])
+  @@index([status, enqueuedAt])
+  @@index([status, lastPolledAt])
+  /// Subject-and-qualification pairs this player ticked, as "maths:GCSE".
+  /// Empty means "anything", which is the default and the setting that matches
+  /// the most people. Two searchers are compatible when these OVERLAP, and the
+  /// match is dealt from what they share.
+  queueStreams String[]
+  /// Topic keys, narrowing within those streams. Empty means any.
+  queueTopics String[]
+
+}
+
+/// One ranked battle between two players.
+model Match {
+  id     String           @id @default(cuid())
+  status ArenaMatchStatus @default(STARTING)
+
+  /// The subject the pool was drawn from, for display and stats.
+  subject String?
+  /// Whether the pool came from content both players had studied, or was
+  /// widened to the shared subject because the strict overlap was too thin.
+  pooledFrom String @default("shared_studied")
+
+  /// The dealt hand, in order. Fixed at creation; never regenerated.
+  questionIds String[]
+
+  /// Which table `questionIds` refers to: "library" for questions from the
+  /// players' own quizzes, "bank" for the permanent curriculum bank. Defaulted
+  /// so every match played before the bank existed still resolves correctly.
+  questionSource String @default("library")
+
+  /// Server clock only. The client countdown is cosmetic, exactly like the
+  /// quiz attempt deadline.
+  startsAt DateTime
+  endsAt   DateTime
+
+  winnerId String?
+  isDraw   Boolean @default(false)
+
+  createdAt   DateTime  @default(now())
+  completedAt DateTime?
+
+  players      MatchPlayer[]
+  queueEntries MatchQueueEntry[]
+  eloEvents    EloEvent[]
+
+  @@index([status, endsAt])
+  @@index([createdAt])
+}
+
+/// A player's side of a match: their result, and the Elo it moved.
+model MatchPlayer {
+  id      String @id @default(cuid())
+  matchId String
+  userId  String
+
+  /// Server-computed. See lib/arena/scoring.ts.
+  score          Int @default(0)
+  answered       Int @default(0)
+  correct        Int @default(0)
+  totalResponseMs Int @default(0)
+
+  outcome MatchOutcome?
+
+  eloBefore Int
+  eloAfter  Int?
+  eloDelta  Int?
+  rankBefore String
+  rankAfter  String?
+
+  coinsAwarded Int @default(0)
+
+  /// Set when the player's client reports it has stopped, or at finalisation.
+  finishedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  match   Match         @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  user    User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  answers MatchAnswer[]
+
+  @@unique([matchId, userId])
+  @@index([userId, createdAt])
+}
+
+/// One answer. `correct` is decided here, on the server, from the question.
+model MatchAnswer {
+  id            String @id @default(cuid())
+  matchPlayerId String
+  questionId    String
+
+  /// Index into Match.questionIds — the position both players saw it at.
+  position Int
+
+  /// What the player picked. Option ids for choice questions, a trimmed string
+  /// for numeric ones. Never the correctness.
+  selectedOptionIds String[]
+  numericAnswer     String?
+
+  correct    Boolean
+  responseMs Int
+
+  answeredAt DateTime @default(now())
+
+  player MatchPlayer @relation(fields: [matchPlayerId], references: [id], onDelete: Cascade)
+
+  @@unique([matchPlayerId, position])
+  @@index([questionId])
+}
+
+/// An Elo movement, so the rank page can show recent gains and losses without
+/// reconstructing them from match history.
+model EloEvent {
+  id      String @id @default(cuid())
+  userId  String
+  matchId String?
+
+  delta    Int
+  eloAfter Int
+  rankAfter String
+  /// "match" today; leaves room for seasonal resets and adjustments.
+  reason   String @default("match")
+
+  createdAt DateTime @default(now())
+
+  user  User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  match Match? @relation(fields: [matchId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+}
+
+/// The cosmetic catalogue. Seeded, not user-generated.
+///
+/// `placeholderLabel` is what the red circle prints until real artwork exists;
+/// `spriteKey` is the hook that replaces it. Swapping in sprites is a change to
+/// the renderer plus this one column, not to the shop, the inventory or the
+/// equipping rules.
+model CosmeticItem {
+  id       String           @id @default(cuid())
+  slug     String           @unique
+  category CosmeticCategory
+  name     String
+  description String
+  /// Study Coins.
+  price    Int
+  placeholderLabel String
+  /// RESERVED for real artwork. Null means render the placeholder.
+  spriteKey String?
+  sortOrder Int     @default(0)
+  isActive  Boolean @default(true)
+
+  createdAt DateTime @default(now())
+
+  ownerships CosmeticOwnership[]
+  equipped   EquippedCosmetic[]
+
+  @@index([category, sortOrder])
+}
+
+/// Permanent ownership. The unique key is what makes buying twice impossible.
+model CosmeticOwnership {
+  id     String @id @default(cuid())
+  userId String
+  itemId String
+
+  /// What was actually paid, so a later price change cannot rewrite history.
+  pricePaid   Int
+  purchasedAt DateTime @default(now())
+
+  user User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  item CosmeticItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, itemId])
+  @@index([userId])
+}
+
+/// What is currently worn. One item per category per user.
+model EquippedCosmetic {
+  id       String           @id @default(cuid())
+  userId   String
+  category CosmeticCategory
+  itemId   String
+
+  equippedAt DateTime @default(now())
+
+  user User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  item CosmeticItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, category])
+  @@index([userId])
+}
+
+/* ==========================================================================
+   The permanent question bank
+   ==========================================================================
+
+   Purely additive. Nothing above is modified, and the existing quiz
+   generation system keeps working exactly as it did — the bank sits alongside
+   it and powers Study 1v1, ranked, practice and daily challenges, while
+   user-authored and AI-generated quizzes stay on `Question`.
+
+   Two separate tables rather than one shared with `Question` because the two
+   have genuinely different lifecycles: a `Question` belongs to a user's quiz
+   and disappears with it, while a `BankQuestion` is permanent, curriculum-
+   tagged and shared by everybody. Forcing them together would mean nullable
+   ownership on one side and nullable curriculum tags on the other, and every
+   query would have to remember which kind it was looking at.
+*/
+
+enum BankLevel {
+  YEAR_10
+  YEAR_11
+  YEAR_12
+  YEAR_13
+}
+
+enum BankType {
+  MCQ_SINGLE
+  MCQ_MULTI
+  NUMERIC
+  SHORT_ANSWER
+}
+
+model BankQuestion {
+  id String @id @default(cuid())
+
+  /// Stable identity across re-imports: `${generator}:${variant}` for generated
+  /// questions, or the source's own id for imported ones. Re-running the seed
+  /// updates rows rather than duplicating them.
+  sourceKey String @unique
+
+  /// "maths" today. The first subject, not the only one — every query is scoped
+  /// by it so adding Physics is data rather than a migration.
+  subject String @default("maths")
+
+  /// Keys from lib/bank/taxonomy.ts. Free text would defeat the filters.
+  topic    String
+  subtopic String
+
+  /// When the content is normally TAUGHT, which is not how hard it is.
+  curriculumLevel BankLevel
+
+  /// 1-10, within-level. The named band is derived, never stored, so the two
+  /// can never disagree.
+  difficulty Int
+
+  questionType BankType @default(MCQ_SINGLE)
+
+  prompt      String @db.Text
+  /// Canonical answer as text. For a choice question this equals the correct
+  /// option's text; it is never sent to a client mid-battle.
+  answer      String @db.Text
+  explanation String @db.Text
+
+  estimatedSeconds Int @default(60)
+  marks            Int @default(1)
+
+  /// True when the question genuinely needs a calculator. Battles serve only
+  /// questions where this is false — a two-minute race in which one player has
+  /// a calculator open and the other does not measures nothing useful.
+  calculator Boolean @default(false)
+
+  /// Attribution, for anything imported rather than generated. Null on
+  /// generated questions, which have no third-party rights attached.
+  sourceName    String?
+  sourceUrl     String?
+  sourceLicence String?
+
+  /// Soft withdrawal. A question found to be wrong stops being served without
+  /// deleting the history of everyone who already answered it.
+  retired Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  options BankOption[]
+  serves  BankServe[]
+
+  /// The four filters the app actually uses, in the order it uses them.
+  @@index([subject, retired, curriculumLevel, difficulty])
+  @@index([subject, retired, topic, subtopic])
+  @@index([subject, retired, questionType])
+  @@index([subject, retired, topic, curriculumLevel])
+}
+
+model BankOption {
+  id         String @id @default(cuid())
+  questionId String
+
+  text String @db.Text
+  /// Never leaves the server during a live battle.
+  isCorrect Boolean @default(false)
+  /// Authoring order. Serving shuffles per match, as the Arena already does.
+  position Int
+
+  question BankQuestion @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  @@index([questionId])
+}
+
+/// Who has already seen which question.
+///
+/// The reason quizzes stop repeating themselves. Written when a question is
+/// served rather than when it is answered, because a question a student saw and
+/// skipped is still one they have seen.
+model BankServe {
+  id         String @id @default(cuid())
+  userId     String
+  questionId String
+
+  /// "arena" | "practice" | "daily" — so a daily challenge does not exhaust
+  /// the pool a practice session draws from.
+  context String @default("practice")
+
+  servedAt DateTime @default(now())
+
+  user     User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  question BankQuestion @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, questionId, context])
+  @@index([userId, context, servedAt])
+}
